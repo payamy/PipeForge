@@ -1,118 +1,205 @@
+from __future__ import annotations
+
+import json
+import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
-from datetime import datetime
+
 import boto3
-import botocore
+import botocore.config
+from botocore.exceptions import BotoCoreError, ClientError
 
-class Checkpoint(object):
+from pipeforge.errors import CheckpointError
+from pipeforge.util.retry import retry_call
+from pipeforge.util.sql import to_utc
+
+log = logging.getLogger("pipeforge")
+
+_NOT_FOUND = {"NoSuchKey", "404", "NotFound"}
+
+
+def _safe(part: str) -> str:
+    return str(part).replace("/", "_").replace("\\", "_")
+
+
+def _transient_s3(exc: BaseException) -> bool:
+    if isinstance(exc, ClientError):
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0)
+        return code in {"SlowDown", "RequestTimeout", "InternalError", "ServiceUnavailable"} or status >= 500
+    return isinstance(exc, BotoCoreError)
+
+
+class Checkpoint:
+    """Watermark store, in S3 or on local disk.
+
+    Object key: ``checkpoints/<db>/<schema>/<table>.json``. The value is a
+    timezone-aware UTC instant, the source-consistent high-water mark.
+    ``get_checkpoint`` returns ``None`` only when no checkpoint exists. Every
+    other failure raises :class:`CheckpointError`.
     """
-    Static class for setting datetime checkpoints.
-    """
 
-    checkpoint_dir = Path(__file__).parent.parent.parent.joinpath("pipeforge_checkpoint")
-    use_s3 = False  # Default is False, use local filesystem
-
-    # S3 configuration variables (initially None)
+    KEY_PREFIX = "checkpoints"
+    checkpoint_dir = Path(os.getenv("PIPEFORGE_CHECKPOINT_DIR", "pipeforge_checkpoint"))
+    use_s3 = False
     s3_bucket_name = None
     s3_endpoint_url = None
-    s3_access_key = None
-    s3_secret_key = None
     s3_client = None
+    retry_attempts = 3
+    retry_base_delay = 1.0
 
     @classmethod
-    def configure_s3(cls, bucket_name: str, endpoint_url: str, access_key: str, secret_key: str):
-        """
-        Configure S3 settings for the checkpoint.
-        :param bucket_name: S3 bucket name
-        :param endpoint_url: S3 endpoint URL
-        :param access_key: S3 access key
-        :param secret_key: S3 secret key
-        :return: None
-        """
+    def reset(cls) -> None:
+        cls.use_s3 = False
+        cls.s3_bucket_name = cls.s3_endpoint_url = cls.s3_client = None
+
+    @classmethod
+    def configure_s3(cls, bucket_name: str, endpoint_url: str | None, access_key: str | None,
+                     secret_key: str | None, region: str | None = None, path_style: bool = True,
+                     create_bucket: bool = False, verify: bool | str | None = None) -> None:
+        """Configure S3 storage. A missing bucket raises unless ``create_bucket`` is True."""
+        cfg = botocore.config.Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "path" if path_style else "auto"},
+            retries={"max_attempts": 2},
+        )
+        client = boto3.client("s3", endpoint_url=endpoint_url, aws_access_key_id=access_key,
+                              aws_secret_access_key=secret_key, region_name=region or "us-east-1",
+                              config=cfg, verify=verify)
+        try:
+            retry_call(lambda: client.head_bucket(Bucket=bucket_name), attempts=cls.retry_attempts,
+                       base_delay=cls.retry_base_delay, should_retry=_transient_s3, what="head_bucket")
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            if code in {"404", "NoSuchBucket", "NotFound"}:
+                if not create_bucket:
+                    raise CheckpointError(
+                        f"checkpoint bucket '{bucket_name}' does not exist and create_bucket is disabled"
+                    ) from exc
+                try:
+                    client.create_bucket(Bucket=bucket_name)
+                except (ClientError, BotoCoreError) as exc2:
+                    raise CheckpointError(f"cannot create bucket '{bucket_name}': {exc2}") from exc2
+            else:
+                raise CheckpointError(f"cannot access checkpoint bucket '{bucket_name}': {exc}") from exc
+        except BotoCoreError as exc:
+            raise CheckpointError(f"cannot reach S3 endpoint: {exc}") from exc
         cls.use_s3 = True
         cls.s3_bucket_name = bucket_name
         cls.s3_endpoint_url = endpoint_url
-        cls.s3_access_key = access_key
-        cls.s3_secret_key = secret_key
-
-        cls.s3_client = boto3.client(
-            's3',
-            endpoint_url=cls.s3_endpoint_url,
-            aws_access_key_id=cls.s3_access_key,
-            aws_secret_access_key=cls.s3_secret_key,
-            config=botocore.client.Config(signature_version='s3v4')
-        )
-
-        bucket_loc = cls.s3_client.get_bucket_location(Bucket=bucket_name)
-        if bucket_loc is None:
-            cls.s3_client.create_bucket(Bucket=bucket_name)
+        cls.s3_client = client
 
     @classmethod
-    def get_checkpoint(cls, db: str, table: str, schema: str = 'main') -> datetime | None:
-        """
-        Reading checkpoints from disk or S3.
-        :param db: Database name
-        :param table: Table name
-        :param schema: Schema title
-        :return: Returns datetime object or None if not found
-        """
-        filename = f"{db}-{schema}-{table}.txt"
+    def configure_local(cls, directory: str | os.PathLike) -> None:
+        cls.use_s3 = False
+        cls.checkpoint_dir = Path(directory)
 
+    @classmethod
+    def validate_connection(cls) -> None:
+        """Raise CheckpointError unless the store is reachable."""
         if cls.use_s3:
-            if cls.s3_client is None:
-                raise ValueError("S3 is not configured. Call 'configure_s3' first.")
             try:
-                response = cls.s3_client.get_object(Bucket=cls.s3_bucket_name,
-                                                    Key=cls.find_object_key_by_filename(s3_client=cls.s3_client,
-                                                                                        bucket_name=cls.s3_bucket_name,
-                                                                                        file_name=filename))
-                content = response['Body'].read().decode('utf-8')
-                return datetime.strptime(content, "%Y-%m-%d %H:%M:%S")
-            except cls.s3_client.exceptions.NoSuchKey:
-                return None
-            except Exception as e:
-                print(f"Error reading from S3: {e}")
-                return None
+                retry_call(lambda: cls.s3_client.head_bucket(Bucket=cls.s3_bucket_name),
+                           attempts=cls.retry_attempts, base_delay=cls.retry_base_delay,
+                           should_retry=_transient_s3, what="checkpoint validation")
+            except (ClientError, BotoCoreError) as exc:
+                raise CheckpointError(f"checkpoint store unreachable: {exc}") from exc
         else:
             try:
-                with open(cls.checkpoint_dir.joinpath(filename), 'r') as f:
-                    return datetime.strptime(f.read(), "%Y-%m-%d %H:%M:%S")
-            except FileNotFoundError:
-                return None
+                cls.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise CheckpointError(f"checkpoint dir not writable: {exc}") from exc
+
+    @classmethod
+    def object_key(cls, db: str, table: str, schema: str = "main") -> str:
+        return f"{cls.KEY_PREFIX}/{_safe(db)}/{_safe(schema)}/{_safe(table)}.json"
 
     @staticmethod
-    def find_object_key_by_filename(s3_client, bucket_name, file_name):
-        # List all objects in the bucket
-        paginator = s3_client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=bucket_name):
-            if "Contents" in page:
-                for obj in page["Contents"]:
-                    if obj["Key"] == file_name:  # Check if the file name matches
-                        return obj["Key"]
-        return None
+    def _legacy_key(db: str, table: str, schema: str) -> str:
+        return f"{db}-{schema}-{table}.txt"
+
+    @staticmethod
+    def _serialize(watermark: datetime) -> str:
+        return json.dumps({"version": 1, "watermark": to_utc(watermark).isoformat(),
+                           "written_at": datetime.now(timezone.utc).isoformat()})
+
+    @staticmethod
+    def _parse(content: str) -> datetime:
+        content = content.strip()
+        try:
+            if content.startswith("{"):
+                return to_utc(datetime.fromisoformat(json.loads(content)["watermark"]))
+            # legacy "%Y-%m-%d %H:%M:%S" naive driver-local value, interpreted as UTC
+            return to_utc(datetime.strptime(content, "%Y-%m-%d %H:%M:%S"))
+        except (ValueError, KeyError, TypeError) as exc:
+            raise CheckpointError(f"corrupt checkpoint content: {content[:80]!r}") from exc
 
     @classmethod
-    def set_checkpoint(cls, checkpoint_datetime: datetime, db: str, table: str, schema: str = 'main'):
-        """
-        Writing checkpoints to disk or S3.
-        :param checkpoint_datetime: DateTime value
-        :param db: Database name
-        :param table: Table name
-        :param schema: Schema title
-        :return: None
-        """
-        filename = f"{db}-{schema}-{table}.txt"
-        content = checkpoint_datetime.strftime("%Y-%m-%d %H:%M:%S")
+    def _s3_read(cls, key: str) -> str | None:
+        def _get():
+            try:
+                obj = cls.s3_client.get_object(Bucket=cls.s3_bucket_name, Key=key)
+                return obj["Body"].read().decode("utf-8")
+            except ClientError as exc:
+                if str(exc.response.get("Error", {}).get("Code", "")) in _NOT_FOUND:
+                    return None
+                raise
+        try:
+            return retry_call(_get, attempts=cls.retry_attempts, base_delay=cls.retry_base_delay,
+                              should_retry=_transient_s3, what=f"read checkpoint {key}")
+        except (ClientError, BotoCoreError) as exc:
+            raise CheckpointError(f"cannot read checkpoint '{key}': {exc}") from exc
 
+    @classmethod
+    def get_checkpoint(cls, db: str, table: str, schema: str = "main") -> datetime | None:
+        """Return the UTC watermark, or None if there is none. Errors raise."""
+        key = cls.object_key(db, table, schema)
+        legacy = cls._legacy_key(db, table, schema)
         if cls.use_s3:
             if cls.s3_client is None:
-                raise ValueError("S3 is not configured. Call 'configure_s3' first.")
-            try:
-                cls.s3_client.put_object(Bucket=cls.s3_bucket_name, Key=filename, Body=content)
-            except Exception as e:
-                print(f"Error writing to S3: {e}")
+                raise CheckpointError("S3 is not configured. Call 'configure_s3' first.")
+            content = cls._s3_read(key)
+            if content is None:
+                content = cls._s3_read(legacy)
+                if content is not None:
+                    log.warning("using legacy checkpoint %s (naive time assumed UTC)", legacy)
         else:
-            if not os.path.exists(cls.checkpoint_dir):
-                os.makedirs(cls.checkpoint_dir)
-            with open(cls.checkpoint_dir.joinpath(filename), 'w') as f:
-                f.write(content)
+            content = None
+            for rel in (key, legacy):
+                path = cls.checkpoint_dir / rel
+                try:
+                    content = path.read_text(encoding="utf-8")
+                    break
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    raise CheckpointError(f"cannot read checkpoint '{path}': {exc}") from exc
+        return None if content is None else cls._parse(content)
+
+    @classmethod
+    def set_checkpoint(cls, checkpoint_datetime: datetime, db: str, table: str,
+                       schema: str = "main") -> None:
+        """Persist the watermark. Raises CheckpointError on any failure."""
+        key = cls.object_key(db, table, schema)
+        body = cls._serialize(checkpoint_datetime)
+        if cls.use_s3:
+            if cls.s3_client is None:
+                raise CheckpointError("S3 is not configured. Call 'configure_s3' first.")
+            try:
+                retry_call(lambda: cls.s3_client.put_object(
+                    Bucket=cls.s3_bucket_name, Key=key, Body=body.encode("utf-8"),
+                    ContentType="application/json"),
+                    attempts=cls.retry_attempts, base_delay=cls.retry_base_delay,
+                    should_retry=_transient_s3, what=f"write checkpoint {key}")
+            except (ClientError, BotoCoreError) as exc:
+                raise CheckpointError(f"cannot write checkpoint '{key}': {exc}") from exc
+        else:
+            path = cls.checkpoint_dir / key
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(body, encoding="utf-8")
+                os.replace(tmp, path)
+            except OSError as exc:
+                raise CheckpointError(f"cannot write checkpoint '{path}': {exc}") from exc

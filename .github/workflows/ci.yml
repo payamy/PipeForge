@@ -1,0 +1,38 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install ruff==0.7.1
+      - run: ruff check pipeforge tests
+
+  tests:
+    # Unit + integration tests run inside the Spark 3.5.2 image (Python 3.10), against Postgres + RustFS.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose -f docker-compose.test.yml up --build --abort-on-container-exit --exit-code-from tests
+      - if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
+  image:
+    # Builds pipeforge-job from a published spark-base tag. Set repo variables SPARK_BASE_IMAGE / SPARK_BASE_TAG.
+    runs-on: ubuntu-24.04
+    needs: [lint, tests]
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          docker build -f docker/Dockerfile \
+            --build-arg SPARK_BASE_IMAGE="${{ vars.SPARK_BASE_IMAGE || 'spark-base' }}" \
+            --build-arg SPARK_BASE_TAG="${{ vars.SPARK_BASE_TAG || '3.5.2-delta3.2.0' }}" \
+            -t pipeforge-job:ci .
+      - run: docker run --rm pipeforge-job:ci --version

@@ -1,0 +1,42 @@
+# Integration test stack: Postgres (source) + RustFS (S3) + the test runner.
+#   docker compose -f docker-compose.test.yml up --build --abort-on-container-exit --exit-code-from tests
+# Credentials below are throwaway test values for this stack only.
+services:
+  postgres:
+    image: postgres:16.4
+    environment:
+      POSTGRES_USER: pf_test
+      POSTGRES_PASSWORD: pf_test_pw
+      POSTGRES_DB: source
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pf_test -d source"]
+      interval: 3s
+      retries: 20
+
+  s3:
+    image: rustfs/rustfs:1.0.6
+    environment:
+      RUSTFS_ACCESS_KEY: pf_test_key
+      RUSTFS_SECRET_KEY: pf_test_secret_key
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: ":9000"
+    tmpfs:
+      - /data:mode=1777
+
+  tests:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.test
+    depends_on:
+      postgres: {condition: service_healthy}
+      s3: {condition: service_started}
+    environment:
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DB: source
+      PG_USER: pf_test
+      PG_PASSWORD: pf_test_pw
+      S3_ENDPOINT: http://s3:9000
+      S3_ACCESS_KEY: pf_test_key
+      S3_SECRET_KEY: pf_test_secret_key
+    command: ["pytest", "-v", "tests"]

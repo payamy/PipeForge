@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/payamy/PipeForge/blob/main/pipeforge/spec/job-spec.v1.schema.json",
+  "title": "PipeForge job spec v1",
+  "description": "Declarative description of one replication job. Secrets are never inline: use {\"env\": NAME} or {\"file\": PATH} references.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["spec_version", "source", "target", "mode", "storage"],
+  "properties": {
+    "spec_version": {"const": "1"},
+    "run_id": {"type": "string", "maxLength": 128, "description": "Opaque id echoed in the result line."},
+    "mode": {"enum": ["full", "incremental"]},
+    "on_missing_checkpoint": {
+      "enum": ["full_refresh", "fail"], "default": "full_refresh",
+      "description": "Incremental mode without a checkpoint: do an initial full load, or fail."
+    },
+    "incremental": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"lookback_seconds": {"type": "integer", "minimum": 0, "default": 0}}
+    },
+    "source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "connection", "table"],
+      "properties": {
+        "type": {"const": "postgres"},
+        "connection": {
+          "type": "object", "additionalProperties": false,
+          "required": ["host", "database", "username", "password"],
+          "properties": {
+            "host": {"type": "string", "minLength": 1},
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535, "default": 5432},
+            "database": {"type": "string", "minLength": 1},
+            "sslmode": {"enum": ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"]},
+            "username": {"$ref": "#/$defs/secretRef"},
+            "password": {"$ref": "#/$defs/secretRef"}
+          }
+        },
+        "schema": {"type": "string", "default": "public"},
+        "table": {"type": "string", "minLength": 1},
+        "columns": {"type": ["array", "null"], "items": {"type": "string", "minLength": 1}, "minItems": 1},
+        "cursor_fields": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "unique_key": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "uniqueItems": true},
+        "read_partition_column": {"type": "string", "description": "Numeric column used to split the JDBC read."},
+        "read_partition_size": {"type": "integer", "minimum": 1, "default": 10000},
+        "max_read_partitions": {"type": "integer", "minimum": 1, "default": 64}
+      }
+    },
+    "target": {
+      "type": "object", "additionalProperties": false,
+      "required": ["database", "table"],
+      "properties": {
+        "database": {"type": "string", "minLength": 1},
+        "table": {"type": "string", "minLength": 1},
+        "partition_by": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "on_duplicate_keys": {"enum": ["fail", "latest"], "default": "fail"},
+        "schema_evolution": {"type": "boolean", "default": false}
+      }
+    },
+    "storage": {
+      "type": "object", "additionalProperties": false,
+      "required": ["s3", "warehouse", "checkpoint_bucket"],
+      "properties": {
+        "s3": {
+          "type": "object", "additionalProperties": false,
+          "required": ["endpoint", "access_key", "secret_key"],
+          "properties": {
+            "endpoint": {"type": "string", "pattern": "^https?://"},
+            "path_style": {"type": "boolean", "default": true},
+            "region": {"type": "string"},
+            "access_key": {"$ref": "#/$defs/secretRef"},
+            "secret_key": {"$ref": "#/$defs/secretRef"}
+          }
+        },
+        "warehouse": {"type": "string", "pattern": "^s3a://", "description": "spark.sql.warehouse.dir"},
+        "checkpoint_bucket": {"type": "string", "minLength": 1},
+        "create_checkpoint_bucket": {"type": "boolean", "default": false}
+      }
+    },
+    "metastore": {
+      "type": "object", "additionalProperties": false,
+      "required": ["uri"],
+      "properties": {"uri": {"type": "string", "pattern": "^thrift://"}}
+    },
+    "spark": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "master": {"type": "string", "default": "local[*]"},
+        "app_name": {"type": "string"},
+        "conf": {"type": "object", "additionalProperties": {"type": "string"}}
+      }
+    },
+    "retry": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "attempts": {"type": "integer", "minimum": 1, "maximum": 10, "default": 3},
+        "base_delay_seconds": {"type": "number", "minimum": 0, "default": 1}
+      }
+    },
+    "transformers": {
+      "type": "array", "items": {"type": "string", "pattern": "^[A-Za-z_][\\w.]*:[A-Za-z_]\\w*$"},
+      "description": "Importable transformer classes, 'package.module:ClassName'."
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"mode": {"const": "incremental"}}},
+      "then": {
+        "properties": {"source": {"required": ["cursor_fields"], "properties": {"cursor_fields": {"minItems": 1}}}}
+      }
+    }
+  ],
+  "$defs": {
+    "secretRef": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["env"],
+         "properties": {"env": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"}}},
+        {"type": "object", "additionalProperties": false, "required": ["file"],
+         "properties": {"file": {"type": "string", "minLength": 1}}}
+      ]
+    }
+  }
+}
