@@ -1,0 +1,44 @@
+{
+  "spec_version": "1",
+  "run_id": "optional-opaque-id",
+  "mode": "incremental",
+  "on_missing_checkpoint": "full_refresh",
+  "incremental": {"lookback_seconds": 300},
+  "source": {
+    "type": "postgres",
+    "connection": {
+      "host": "source-db.internal",
+      "port": 5432,
+      "database": "app",
+      "sslmode": "require",
+      "username": {"env": "SOURCE_DB_USER"},
+      "password": {"file": "/var/run/secrets/source/password"}
+    },
+    "schema": "public",
+    "table": "Users",
+    "columns": ["id", "email", "registration_date", "updated_at"],
+    "cursor_fields": ["updated_at"],
+    "unique_key": ["id"],
+    "read_partition_column": "id"
+  },
+  "target": {
+    "database": "bronze",
+    "table": "users",
+    "partition_by": [],
+    "on_duplicate_keys": "latest",
+    "schema_evolution": false
+  },
+  "storage": {
+    "s3": {
+      "endpoint": "https://rustfs.internal:9000",
+      "path_style": true,
+      "access_key": {"env": "S3_ACCESS_KEY"},
+      "secret_key": {"env": "S3_SECRET_KEY"}
+    },
+    "warehouse": "s3a://warehouse/",
+    "checkpoint_bucket": "checkpoints"
+  },
+  "metastore": {"uri": "thrift://hive-metastore:9083"},
+  "spark": {"master": "local[*]", "conf": {"spark.driver.memory": "2g"}},
+  "retry": {"attempts": 3, "base_delay_seconds": 1}
+}
