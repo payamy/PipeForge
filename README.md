@@ -97,4 +97,4 @@ The test runner deliberately uses `TZ=Asia/Tehran` to prove results do not depen
 
 Subclass `pipeforge.transformer.Transformer`, implement `transform(df)`, and list `package.module:ClassName` under `transformers` in the spec (the module must be importable in the image).
 
-Design decisions are recorded in [docs/adr](docs/adr/README.md). See [CHANGELOG.md](CHANGELOG.md) for breaking changes in 2.0.0.
+Design decisions are recorded in [docs/adr](docs/adr/README.md); the delivery report is in [docs/reports](docs/reports/task-1-pipeforge-report.md). See [CHANGELOG.md](CHANGELOG.md) for breaking changes in 2.0.0.
