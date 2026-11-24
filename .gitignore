@@ -165,3 +165,8 @@ cython_debug/
 # Checkpoints from table transfering
 pipeforge_checkpoint/*
 !pipeforge_checkpoint/gitkeep
+
+# local checkpoints
+pipeforge_checkpoint/
+.pytest_cache/
+.ruff_cache/
