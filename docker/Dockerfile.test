@@ -1,0 +1,27 @@
+# Test runner: official Spark 3.5.2 image + the standard jar set baked in at build time.
+# Mirrors SparkLake's spark-base (Spark 3.5.2 / Scala 2.12 / Delta 3.2.0 / hadoop-aws 3.3.4).
+FROM spark:3.5.2-scala2.12-java17-python3-ubuntu
+
+ARG DELTA_VERSION=3.2.0
+ARG HADOOP_AWS_VERSION=3.3.4
+ARG AWS_SDK_BUNDLE_VERSION=1.12.262
+ARG POSTGRES_JDBC_VERSION=42.7.3
+
+USER root
+ADD https://repo1.maven.org/maven2/io/delta/delta-spark_2.12/${DELTA_VERSION}/delta-spark_2.12-${DELTA_VERSION}.jar /opt/spark/jars/
+ADD https://repo1.maven.org/maven2/io/delta/delta-storage/${DELTA_VERSION}/delta-storage-${DELTA_VERSION}.jar /opt/spark/jars/
+ADD https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar /opt/spark/jars/
+ADD https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_BUNDLE_VERSION}/aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar /opt/spark/jars/
+ADD https://repo1.maven.org/maven2/org/postgresql/postgresql/${POSTGRES_JDBC_VERSION}/postgresql-${POSTGRES_JDBC_VERSION}.jar /opt/spark/jars/
+RUN chmod 644 /opt/spark/jars/*.jar
+
+ENV TZ=Asia/Tehran \
+    PYTHONPATH=/opt/spark/python:/opt/spark/python/lib/py4j-0.10.9.7-src.zip \
+    PIPEFORGE_TEST_IMAGE=1
+# TZ is deliberately NOT UTC here: it proves results do not depend on the driver's clock zone.
+
+WORKDIR /src
+COPY . /src
+RUN pip install --no-cache-dir -e ".[dev]"
+USER spark
+CMD ["pytest", "-v", "tests"]
